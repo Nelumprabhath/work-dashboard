@@ -1,0 +1,14 @@
+# Never commit backups or secrets
+dashboard_backup_*.json
+*.token
+.env
+.env.*
+secrets.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.vscode/
+.idea/
