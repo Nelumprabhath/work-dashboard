@@ -201,6 +201,7 @@ button{font-family:inherit;}
   </div>
   <div class="hdr-right">
     <input id="gSearch" placeholder="🔍 Search all tasks…  (Ctrl+K)" style="background:var(--surface2);border:1.5px solid var(--border2);border-radius:8px;padding:8px 12px;font-size:12px;color:var(--text);outline:none;width:220px;" oninput="globalSearch(this.value)">
+    <button class="hbtn" id="updBtn" onclick="updateDashboard()" title="Pull new tasks from tasks.js, then sync">⟳ Update</button>
     <button class="hbtn" id="syncBtn" onclick="syncNow()" title="Sync with private Gist">☁ Sync</button>
     <span id="syncState" style="font-size:10px;color:var(--text3);min-width:70px;"></span>
     <button class="hbtn" onclick="openSyncSettings()" title="Cloud sync settings">&#9881;</button>
@@ -739,13 +740,47 @@ function exportData(){
   a.download='dashboard_backup_'+today()+'.json';
   a.click();URL.revokeObjectURL(a.href);
 }
+function mergePack(d){
+  const have=new Set(DB.tasks.map(t=>t.id));
+  let added=0,filled=0;
+  (d.tasks||[]).forEach(s=>{
+    if(!have.has(s.id)){DB.tasks.push(remapGroup(JSON.parse(JSON.stringify(s))));added++;}
+    else{
+      const t=findTask(s.id);
+      if(t&&(!t.subtasks||!t.subtasks.length)&&s.subtasks&&s.subtasks.length){
+        t.subtasks=JSON.parse(JSON.stringify(s.subtasks));filled++;
+      }
+    }
+  });
+  (d.groups||[]).forEach(g=>{if(!DB.groups.includes(g))DB.groups.push(g);});
+  const gHave=new Set((DB.goals||[]).map(g=>g.id));
+  let goals=0;
+  (d.goals||[]).forEach(g=>{if(!gHave.has(g.id)){DB.goals.push(JSON.parse(JSON.stringify(g)));goals++;}});
+  if((!DB.certs||!DB.certs.length)&&d.certs&&d.certs.length)DB.certs=JSON.parse(JSON.stringify(d.certs));
+  save();rollRecurring();render();
+  const bits=[];
+  if(added)bits.push(added+' new task'+(added>1?'s':''));
+  if(filled)bits.push(filled+' subtask set'+(filled>1?'s':''));
+  if(goals)bits.push(goals+' goal'+(goals>1?'s':''));
+  return bits.length?bits.join(', '):'nothing new — already up to date';
+}
 function importData(inp){
   const f=inp.files[0];if(!f)return;
   const r=new FileReader();
   r.onload=()=>{try{
     const d=JSON.parse(r.result);
     if(!d.tasks||!Array.isArray(d.tasks))throw new Error('invalid file');
-    DB=d;save();render();alert('Import OK — '+d.tasks.length+' tasks loaded.');
+    let merge=!!d.updatePack;
+    if(!merge){
+      merge=confirm('This looks like a full backup ('+d.tasks.length+' tasks).\n\nOK = MERGE into what you have (safe — keeps your edits)\nCancel = REPLACE everything with the file');
+    }
+    if(merge){
+      const msg=mergePack(d);
+      alert('Update applied — '+msg+'.'+(syncCfg.token&&syncCfg.gist?'\nSyncing to your other devices…':''));
+      if(syncCfg.token&&syncCfg.gist)syncNow();
+    }else{
+      DB=d;save();render();alert('Replaced — '+d.tasks.length+' tasks loaded.');
+    }
   }catch(e){alert('Import failed: '+e.message);}};
   r.readAsText(f);inp.value='';
 }
@@ -853,6 +888,60 @@ function autoSync(){
   if(!syncCfg.auto||!syncCfg.token||!syncCfg.gist)return;
   clearTimeout(syncTimer);
   syncTimer=setTimeout(()=>syncNow(),4000);
+}
+
+// ════════ UPDATE FROM tasks.js ════════
+async function updateDashboard(){
+  setSyncState('updating…','var(--amber)');
+  let seed=window.SEED_DATA;
+  // re-fetch tasks.js (cache-busted) when served over http, so edits are picked up without a hard refresh
+  try{
+    if(location.protocol.startsWith('http')){
+      const r=await fetch('tasks.js?t='+Date.now(),{cache:'no-store'});
+      if(r.ok){
+        const txt=await r.text();
+        const sandbox={};
+        new Function('window',txt)(sandbox);
+        if(sandbox.SEED_DATA&&Array.isArray(sandbox.SEED_DATA.tasks))seed=sandbox.SEED_DATA;
+      }
+    }
+  }catch(e){/* fall back to the already-loaded SEED_DATA */}
+
+  const have=new Set(DB.tasks.map(t=>t.id));
+  let added=0,updated=0;
+  (seed.tasks||[]).forEach(s=>{
+    if(!have.has(s.id)){DB.tasks.push(remapGroup(JSON.parse(JSON.stringify(s))));added++;}
+    else{
+      // fill in subtasks only if the local copy has none
+      const t=findTask(s.id);
+      if(t&&(!t.subtasks||!t.subtasks.length)&&s.subtasks&&s.subtasks.length){
+        t.subtasks=JSON.parse(JSON.stringify(s.subtasks));updated++;
+      }
+    }
+  });
+  const gHave=new Set((DB.goals||[]).map(g=>g.id));
+  let goalsAdded=0;
+  (seed.goals||[]).forEach(g=>{if(!gHave.has(g.id)){DB.goals.push(JSON.parse(JSON.stringify(g)));goalsAdded++;}});
+  (seed.groups||[]).forEach(g=>{if(!DB.groups.includes(g))DB.groups.push(g);});
+  if(!DB.certs||!DB.certs.length)DB.certs=JSON.parse(JSON.stringify(seed.certs||[]));
+
+  DB.seededIds=Array.from(new Set((DB.seededIds||[]).concat((seed.tasks||[]).map(t=>t.id))));
+  save();rollRecurring();render();
+
+  const bits=[];
+  if(added)bits.push(added+' new task'+(added>1?'s':''));
+  if(updated)bits.push(updated+' with subtasks');
+  if(goalsAdded)bits.push(goalsAdded+' goal'+(goalsAdded>1?'s':''));
+  const msg=bits.length?bits.join(', '):'already up to date';
+  setSyncState(bits.length?'+'+added+' added':'up to date','var(--green)');
+  if(syncCfg.token&&syncCfg.gist){await syncNow();}
+  if(!bits.length){
+    if(confirm('No new tasks in tasks.js.\n\nLoad an update pack file instead?')){
+      document.getElementById('importFile').click();
+    }
+    return;
+  }
+  alert('Dashboard updated — '+msg+'.'+(syncCfg.token&&syncCfg.gist?'\nSynced to cloud.':'\nSet up ☁ Sync to push this to your other devices.'));
 }
 
 // ════════ CLOCK & INIT ════════
