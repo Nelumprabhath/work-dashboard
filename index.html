@@ -284,6 +284,8 @@ button{font-family:inherit;}
     <div class="m-grid">
       <div class="m-field full"><label>GitHub token (gist scope only)</label><input type="password" id="syncToken" placeholder="ghp_&hellip;"></div>
       <div class="m-field full"><label>Gist ID (blank = create new)</label><input id="syncGist" placeholder="e.g. 8f3a&hellip;"></div>
+      <div class="m-field full"><label>Feed URL (auto-pull new tasks)</label><input id="syncFeed" placeholder="direct-download link to dashboard-feed.json"></div>
+      <div class="m-field full"><label><input type="checkbox" id="syncFeedAuto" style="width:auto;margin-right:6px;">Check feed automatically on every open</label></div>
       <div class="m-field full"><label><input type="checkbox" id="syncAuto" style="width:auto;margin-right:6px;">Auto-sync on open and after each change</label></div>
     </div>
     <div id="syncMsg" style="font-size:11px;color:var(--text2);margin-top:12px;min-height:16px;"></div>
@@ -369,7 +371,12 @@ function initDB(){
   }
   // (one-time data migrations removed from public build)
 }
-function save(){DB.updatedAt=new Date().toISOString();localStorage.setItem(KEY,JSON.stringify(DB));if(typeof autoSync==='function')autoSync();}
+let booting=true;   // don't stamp updatedAt during startup migrations
+function save(){
+  if(!booting)DB.updatedAt=new Date().toISOString();
+  localStorage.setItem(KEY,JSON.stringify(DB));
+  if(typeof autoSync==='function')autoSync();
+}
 
 // ════════ RECURRING ════════
 function nextOccur(d,rec){
@@ -788,7 +795,7 @@ function importData(inp){
 // ════════ CLOUD SYNC (private GitHub Gist) ════════
 const SKEY='prabhath_sync_cfg_v1';
 const GFILE='bistec-dashboard.json';
-let syncCfg={token:'',gist:'',auto:false};
+let syncCfg={token:'',gist:'',auto:false,feed:'',feedAuto:true};
 let syncing=false, syncTimer=null;
 
 function loadSyncCfg(){try{syncCfg=Object.assign(syncCfg,JSON.parse(localStorage.getItem(SKEY))||{});}catch(e){}}
@@ -798,6 +805,8 @@ function openSyncSettings(){
   document.getElementById('syncToken').value=syncCfg.token||'';
   document.getElementById('syncGist').value=syncCfg.gist||'';
   document.getElementById('syncAuto').checked=!!syncCfg.auto;
+  document.getElementById('syncFeed').value=syncCfg.feed||'';
+  document.getElementById('syncFeedAuto').checked=syncCfg.feedAuto!==false;
   document.getElementById('syncMsg').textContent='';
   document.getElementById('syncOverlay').classList.add('open');
 }
@@ -806,7 +815,11 @@ function saveSyncSettings(){
   syncCfg.token=document.getElementById('syncToken').value.trim();
   syncCfg.gist=document.getElementById('syncGist').value.trim();
   syncCfg.auto=document.getElementById('syncAuto').checked;
+  syncCfg.feed=document.getElementById('syncFeed').value.trim();
+  syncCfg.feedAuto=document.getElementById('syncFeedAuto').checked;
   saveSyncCfg();
+  // carry the feed URL in the synced data so other devices pick it up automatically
+  if(syncCfg.feed&&DB.feedUrl!==syncCfg.feed){DB.feedUrl=syncCfg.feed;save();}
   document.getElementById('syncMsg').textContent='Saved. Click Sync to push/pull.';
   setSyncState(syncCfg.token?'ready':'local only');
 }
@@ -865,13 +878,36 @@ async function syncNow(){
     }
     let remote=null;
     try{remote=await readRemote();}catch(e){if(!/404/.test(e.message))throw e;}
+    let remoteCount=0;
     if(remote&&remote.tasks){
+      remoteCount=remote.tasks.length;
       const rT=new Date(remote.updatedAt||0).getTime();
       const lT=new Date(DB.updatedAt||0).getTime();
-      if(rT>lT){
+      // adopt remote when it is newer, OR when this device is empty (fresh install)
+      if(rT>lT||!DB.tasks.length){
         const rIds=new Set(remote.tasks.map(t=>t.id));
         remote.tasks=remote.tasks.concat(DB.tasks.filter(t=>!rIds.has(t.id)));
-        DB=remote;localStorage.setItem(KEY,JSON.stringify(DB));render();
+        const keepFeed=DB.feedUrl||remote.feedUrl;
+        DB=remote;if(keepFeed)DB.feedUrl=keepFeed;
+        localStorage.setItem(KEY,JSON.stringify(DB));render();
+      }else{
+        // remote isn't newer, but still take any tasks/goals this device has never seen
+        const lIds=new Set(DB.tasks.map(t=>t.id));
+        let pulled=0;
+        remote.tasks.forEach(t=>{if(!lIds.has(t.id)){DB.tasks.push(t);pulled++;}});
+        const lg=new Set((DB.goals||[]).map(g=>g.id));
+        (remote.goals||[]).forEach(g=>{if(!lg.has(g.id))DB.goals.push(g);});
+        (remote.groups||[]).forEach(g=>{if(!DB.groups.includes(g))DB.groups.push(g);});
+        if(!DB.feedUrl&&remote.feedUrl)DB.feedUrl=remote.feedUrl;
+        if(pulled){localStorage.setItem(KEY,JSON.stringify(DB));render();}
+      }
+    }
+    // safety: never silently shrink the cloud copy
+    if(remoteCount>0&&DB.tasks.length<remoteCount){
+      const lost=remoteCount-DB.tasks.length;
+      if(!confirm('Warning: the cloud copy has '+remoteCount+' tasks but this device has '+DB.tasks.length+'.\n\nContinuing would remove '+lost+' task(s) for all your devices.\n\nOK = push anyway   Cancel = stop and keep the cloud copy')){
+        setSyncState('push cancelled','var(--amber)');
+        return;
       }
     }
     const up=await gh('/gists/'+syncCfg.gist,{method:'PATCH',body:JSON.stringify({files:{[GFILE]:{content:payload()}}})});
@@ -890,9 +926,52 @@ function autoSync(){
   syncTimer=setTimeout(()=>syncNow(),4000);
 }
 
-// ════════ UPDATE FROM tasks.js ════════
+// ════════ FEED (auto-pull new tasks from a URL) ════════
+function feedUrl(){
+  // fall back to the URL carried in synced data, so a new device needs no setup
+  let u=((syncCfg.feed||DB.feedUrl||'')+'').trim();
+  if(u&&!syncCfg.feed){syncCfg.feed=u;saveSyncCfg();}
+  if(!u)return '';
+  // OneDrive share link -> direct download
+  if(/1drv\.ms|sharepoint\.com|onedrive\.live\.com/.test(u)&&!/download=1/.test(u)){
+    u+=(u.includes('?')?'&':'?')+'download=1';
+  }
+  return u+(u.includes('?')?'&':'?')+'_cb='+Date.now();
+}
+async function checkFeed(quiet){
+  const u=feedUrl();
+  if(!u){if(!quiet)alert('No Feed URL set. Open ⚙ and paste the link.');return 0;}
+  try{
+    if(!quiet)setSyncState('checking feed…','var(--amber)');
+    const r=await fetch(u,{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    if(!d.tasks||!Array.isArray(d.tasks))throw new Error('feed has no tasks array');
+    if(quiet&&d.feedVersion&&DB.feedSeen===d.feedVersion)return 0;  // nothing new since last auto-check
+    const before=DB.tasks.length;
+    const msg=mergePack(d);
+    const added=DB.tasks.length-before;
+    DB.feedSeen=d.feedVersion||d.generated||'';
+    save();
+    if(added&&syncCfg.token&&syncCfg.gist)syncNow();
+    if(!quiet)setSyncState(added?'+'+added+' from feed':'feed up to date','var(--green)');
+    if(added&&quiet){
+      setSyncState('+'+added+' new','var(--green)');
+      const b=document.getElementById('updBtn');
+      if(b){b.textContent='⟳ '+added+' new';b.style.color='var(--green)';b.style.borderColor='var(--green)';}
+    }
+    if(!quiet)alert('Feed checked — '+msg+'.');
+    return added;
+  }catch(e){
+    if(!quiet){setSyncState('feed failed','var(--red)');alert('Feed check failed: '+e.message+'\n\nIf this says CORS or Failed to fetch, the link is not publicly downloadable — regenerate it as "Anyone with the link".');}
+    return 0;
+  }
+}
+
+// ════════ UPDATE FROM tasks.js / FEED ════════
 async function updateDashboard(){
   setSyncState('updating…','var(--amber)');
+  if(syncCfg.feed){await checkFeed(false);return;}
   let seed=window.SEED_DATA;
   // re-fetch tasks.js (cache-busted) when served over http, so edits are picked up without a hard refresh
   try{
@@ -955,7 +1034,10 @@ initDB();
 rollRecurring();
 setSyncState(syncCfg.token&&syncCfg.gist?'ready':'local only');
 if(syncCfg.auto&&syncCfg.token&&syncCfg.gist)setTimeout(()=>syncNow(),1200);
+// auto-check the feed on every open — new tasks appear by themselves
+if((syncCfg.feed||DB.feedUrl)&&syncCfg.feedAuto!==false)setTimeout(()=>checkFeed(true),2200);
 document.getElementById('qaGroup').innerHTML=DB.groups.map(g=>'<option>'+esc(g)+'</option>').join('');
+booting=false;   // startup done — real edits now update the sync timestamp
 tick();setInterval(tick,30000);
 render();
 if('serviceWorker' in navigator && location.protocol.startsWith('http')){
