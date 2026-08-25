@@ -164,6 +164,7 @@ button{font-family:inherit;}
 .fchip{background:var(--surface2);border:1px solid var(--border2);border-radius:16px;padding:5px 12px;font-size:11px;color:var(--text2);cursor:pointer;font-weight:600;}
 .fchip.on{color:var(--cyan);border-color:var(--cyan);background:rgba(6,182,212,.08);}
 .empty{color:var(--text3);font-size:12px;padding:24px;text-align:center;}
+.comp-head{font-size:12px;font-weight:800;color:var(--text2);margin:16px 0 8px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);padding-bottom:6px;}
 .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto;}
 .overlay.open{display:flex;}
 .modal{background:var(--surface);border:1px solid var(--border2);border-radius:14px;width:100%;max-width:620px;padding:20px;}
@@ -270,6 +271,15 @@ button{font-family:inherit;}
     <div id="statBars" style="max-width:640px;"></div>
   </div>
 
+  <div class="page" id="page-completed">
+    <div class="pg-title">✅ Completed Tasks <span class="sub" id="compSub"></span></div>
+    <div class="fbar">
+      <button class="fchip on" id="cgDay" onclick="setCompGroup('day')">📆 By completed day</button>
+      <button class="fchip" id="cgCat" onclick="setCompGroup('cat')">🏷 By category</button>
+    </div>
+    <div id="compList"></div>
+  </div>
+
 </main>
 </div>
 
@@ -370,6 +380,11 @@ function initDB(){
     save();
   }
   // (one-time data migrations removed from public build)
+  // one-time: backfill completedAt from deadline for already-done tasks (2026-08-24)
+  if(!DB.migCompAt){
+    DB.tasks.forEach(t=>{if(t.status==='Done'&&!t.completedAt&&t.deadline)t.completedAt=t.deadline;});
+    DB.migCompAt=1;save();
+  }
 }
 let booting=true;   // don't stamp updatedAt during startup migrations
 function save(){
@@ -396,7 +411,7 @@ function rollRecurring(){
     if(!t.deadline){t.deadline=today();ch++;}
     let moved=false,guard=0;
     while(t.deadline<today()&&guard++<4000){t.deadline=nextOccur(t.deadline,t.recurrence);moved=true;}
-    if(moved){t.status='To Do';(t.subtasks||[]).forEach(s=>s.status='To Do');ch++;}
+    if(moved){t.status='To Do';delete t.completedAt;(t.subtasks||[]).forEach(s=>s.status='To Do');ch++;}
   });
   if(ch)save();
 }
@@ -428,6 +443,7 @@ function navDef(){
   d.push({k:'today',label:'⏰ Today',count:openCount(t=>t.deadline===today())});
   d.push({k:'recurring',label:'↻ Recurring',count:openCount(t=>t.recurrence&&t.recurrence!=='none')});
   d.push({k:'all',label:'📂 All Tasks',count:openCount(()=>true)});
+  d.push({k:'completed',label:'✅ Completed',count:DB.tasks.filter(t=>t.status==='Done').length});
   d.push({sep:1});
   d.push({k:'daily',label:'🗓️ Daily Plan'});
   d.push({k:'calendar',label:'📅 Calendar'});
@@ -452,13 +468,14 @@ function go(k){
 function render(){
   renderNav();
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
-  const pid=view.type==='goals'?'page-goals':view.type==='daily'?'page-daily':view.type==='calendar'?'page-calendar':view.type==='stats'?'page-stats':'page-list';
+  const pid=view.type==='goals'?'page-goals':view.type==='daily'?'page-daily':view.type==='calendar'?'page-calendar':view.type==='stats'?'page-stats':view.type==='completed'?'page-completed':'page-list';
   document.getElementById(pid).classList.add('active');
   if(pid==='page-goals')renderGoals();
   if(pid==='page-list')renderList();
   if(pid==='page-daily')renderDaily();
   if(pid==='page-calendar')renderCal();
   if(pid==='page-stats')renderStats();
+  if(pid==='page-completed')renderCompleted();
 }
 function listFilter(){
   if(view.type==='group')return t=>t.group===view.group;
@@ -501,6 +518,7 @@ function cardHTML(t){
   if(t.goalId&&goalName(t.goalId))h+='<span class="badge b-goal">🎯 '+esc(goalName(t.goalId).slice(0,34))+'</span>';
   h+=dlBadge(t);
   if(t.created)h+='<span class="badge b-status" title="Created date">🕒 '+esc(t.created)+'</span>';
+  if(t.status==='Done'&&t.completedAt)h+='<span class="badge b-status done" title="Completed on">✅ '+esc(t.completedAt)+'</span>';
   if(tot)h+='<span class="badge b-status">☑ '+done+'/'+tot+'</span>';
   h+='</div></div></div>';
   if(open){
@@ -555,13 +573,13 @@ function quickAdd(){
   document.getElementById('qaName').value='';
   save();render();
 }
-function markDone(id){findTask(id).status='Done';save();render();}
+function markDone(id){const t=findTask(id);t.status='Done';t.completedAt=today();save();render();}
 function weekdayName(){return new Date().toLocaleDateString('en-US',{weekday:'long'});}
 function addToToday(id){
   const t=findTask(id);if(!t)return;
   const wd=weekdayName();
   if(t.day===wd&&t.deadline===today()){t.day='';}          // toggle off
-  else{t.day=wd;t.deadline=today();if(t.status==='Done')t.status='In Progress';}
+  else{t.day=wd;t.deadline=today();if(t.status==='Done'){t.status='In Progress';delete t.completedAt;}}
   save();render();
 }
 function delTask(id){if(!confirm('Delete this task?'))return;DB.tasks=DB.tasks.filter(t=>t.id!==id);save();render();}
@@ -603,7 +621,10 @@ function saveModal(){
   t.group=document.getElementById('mGroup').value;
   t.category=document.getElementById('mCategory').value.trim();
   t.priority=document.getElementById('mPriority').value;
-  t.status=document.getElementById('mStatus').value;
+  const nSt=document.getElementById('mStatus').value;
+  if(nSt==='Done'&&t.status!=='Done')t.completedAt=today();
+  if(nSt!=='Done')delete t.completedAt;
+  t.status=nSt;
   t.deadline=document.getElementById('mDeadline').value;
   t.day=document.getElementById('mDay').value;
   t.recurrence=document.getElementById('mRecurrence').value;
@@ -737,6 +758,47 @@ function renderStats(){
     const n=open.filter(t=>t.group===g).length;
     return '<div class="hbar-row"><div class="hl">'+esc(g)+'</div><div class="hbar"><i style="width:'+Math.round(n/max*100)+'%"></i></div><div class="hn">'+n+'</div></div>';
   }).join('');
+}
+
+// ════════ COMPLETED ════════
+let compGroup='day';
+function setCompGroup(m){compGroup=m;document.getElementById('cgDay').classList.toggle('on',m==='day');document.getElementById('cgCat').classList.toggle('on',m==='cat');renderCompleted();}
+function compDate(t){return t.completedAt||'';}
+function fmtCompDay(d){
+  if(!d)return 'Earlier (date not recorded)';
+  const dt=new Date(d+'T00:00:00');
+  const label=dt.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'short',year:'numeric'});
+  if(d===today())return 'Today · '+label;
+  const y=new Date();y.setDate(y.getDate()-1);
+  if(ymd(y)===d)return 'Yesterday · '+label;
+  return label;
+}
+function renderCompleted(){
+  const done=DB.tasks.filter(t=>t.status==='Done');
+  document.getElementById('compSub').textContent=done.length+' task'+(done.length===1?'':'s')+' completed';
+  const el=document.getElementById('compList');
+  if(!done.length){el.innerHTML='<div class="empty">No completed tasks yet.</div>';return;}
+  let h='';
+  if(compGroup==='day'){
+    const by={};
+    done.forEach(t=>{const d=compDate(t);(by[d]=by[d]||[]).push(t);});
+    const keys=Object.keys(by).sort((a,b)=>{if(!a)return 1;if(!b)return -1;return b.localeCompare(a);});
+    keys.forEach(d=>{
+      const ts=by[d].slice().sort((a,b)=>String(a.category||'~').localeCompare(String(b.category||'~'))||String(a.name).localeCompare(String(b.name)));
+      h+='<div class="comp-head">📅 '+esc(fmtCompDay(d))+'<span class="badge b-status done">'+ts.length+'</span></div>';
+      h+='<div class="tlist" style="margin-bottom:18px;">'+ts.map(cardHTML).join('')+'</div>';
+    });
+  }else{
+    const by={};
+    done.forEach(t=>{const c=t.category||'';(by[c]=by[c]||[]).push(t);});
+    const keys=Object.keys(by).sort((a,b)=>{if(!a)return 1;if(!b)return -1;return a.localeCompare(b);});
+    keys.forEach(c=>{
+      const ts=by[c].slice().sort((a,b)=>String(compDate(b)).localeCompare(String(compDate(a))));
+      h+='<div class="comp-head">🏷 '+esc(c||'No category')+'<span class="badge b-status done">'+ts.length+'</span></div>';
+      h+='<div class="tlist" style="margin-bottom:18px;">'+ts.map(cardHTML).join('')+'</div>';
+    });
+  }
+  el.innerHTML=h;
 }
 
 // ════════ EXPORT / IMPORT ════════
